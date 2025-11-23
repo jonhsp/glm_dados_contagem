@@ -1,0 +1,208 @@
+---
+title: "Trabalho 2 – Regressão para dados de contagem (RS)"
+subtitle: "CE314 – Modelos Lineares Generalizados"
+author: "Monica Ludmila, ......"
+output:
+  html_document:
+    theme: journal
+    number_sections: true
+    code_folding: hide
+---
+___ 
+
+Os dados referem-se aos municípios do Rio Grande do Sul, contendo informações de mortalidade e variáveis socioeconômicas.
+A variável resposta é a contagem de pedestres traumatizados em um acidente de transporte. Disponíevel na guia Óbitos por causas externas, na seção Mortalidade – desde 1996 pela CID10
+
+# Variáveis Pré-Selecionadas
+
+<br><br>
+
+| Variável | Descrição | Tipo |
+| :--- | :--- | :---
+| `obts` | Pedestre traumatizado em um acidente de transporte |	Contagem (resposta). |
+| `pop_est` | População estimada do município |	Contagem (offset – exposição)|
+| `saneat` | Número de moradores com saneamento adequado |	Contagem |
+| `pib_pc` | PIB per capita do município |	Contínua |
+| `prop_bx_renda` | Proporção de pessoas com baixa renda |	Contínua |
+| `renda_med_dom` | Renda média domiciliar | Contínua |
+| `tx_analf` | Taxa de analfabetismo (%) |	Contínua |
+| `municipio` | Nome do município |	Categórica (identificação) |
+
+A variável resposta será o número de óbitos (obt_ocor), modelado como contagem. A variável pop_est será utilizada como offset (log da população) para ajustar o modelo pela exposição.
+
+# Preparação dos Dados
+<br><br>
+
+## Leitura
+```{r setup, message=FALSE, warning=FALSE, include=FALSE}
+libs <- c("ggplot2",
+          "dplyr",
+          "tidyverse",
+          "magrittr",
+          "stringr",
+          "ggeffects",
+          "gridExtra",
+          "car",
+          "hnp",
+          "plotly",
+          "rgl",
+          "magick",
+          "viridis")
+
+for (lib in libs){
+  
+  if(!require(lib, character.only = TRUE)) install.packages(lib, repos = "https://cran-r.c3sl.ufpr.br/")
+  
+  library(lib, character.only = TRUE)
+}
+
+```
+
+```{r leitura, message=FALSE, warning=FALSE}
+url <- "https://gist.githubusercontent.com/jonhsp/83dd3cee85f9db48af0652fe7cd7ec97/raw/e503d660eac30e8eeec6ff2e1e20a46189440dce/DadosParaPobreSemExcel%2520-%2520DadosParaPobreSemExcel.csv"
+
+df <- read_csv(url)
+
+```
+
+# Tratando a base 
+```{r}
+# Renomeando para nomes mais simples
+
+df <- df %>%
+  rename(
+    municipio      = Municipio,
+    obts           = obts,
+    saneat         = Saneat,
+    pib_pc         = PibPerCapita,
+    prop_bx_renda  = PrpBxRnd,
+    renda_med_dom  = RndMdDom,
+    tx_analf       = TxAnalf,
+    pop_est        = PopEst
+  ) %>%
+# Garantindo tipo numérico nas variáveis quantitativas
+mutate(
+  across(
+    c(obts, saneat, pib_pc, prop_bx_renda,
+      renda_med_dom, tx_analf, pop_est),
+    ~ as.numeric(.x)
+  )
+) %>%
+# Removendo linhas com NA
+drop_na() %>%
+# Removendo municípios com população zero (evita log(0))
+  filter(pop_est > 0)
+summary(df)
+
+```
+
+# Análise Exploratória
+
+## Distribuição da Variável Resposta (Y)
+
+Visualizamos a distribuição da contagem de óbitos (`obts`) para identificar a assimetria característica de dados de contagem e a presença de *outliers*.
+
+```{r eda_distribuicao, message=FALSE, warning=FALSE, fig.width=10, fig.height=4}
+library(gridExtra)
+
+# 1. Histograma da Contagem Absoluta
+p1 <- ggplot(df, aes(x = obts)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.9) +
+  labs(title = "Distribuição de Óbitos", 
+       subtitle = "Histograma da Variável Resposta",
+       x = "Número de Óbitos", y = "Frequência") +
+  theme_light()
+
+# 2. Boxplot da Contagem
+p2 <- ggplot(df, aes(y = obts)) +
+  geom_boxplot(fill = "steelblue", outlier.colour = "red", outlier.shape = 1, alpha = 0.9) +
+  labs(title = "Boxplot de Óbitos", 
+       subtitle = "Identificação de Outliers",
+       y = "Número de Óbitos", x = "") +
+  theme_light() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## Correlação entre Variáveis (Multicolinearidade)
+
+Verificamos a estrutura de correlação entre todas as variáveis numéricas disponíveis. O objetivo é identificar redundâncias que possam causar instabilidade no modelo (Multicolinearidade).
+
+```{r eda_correlacao, message=FALSE, warning=FALSE, fig.align='center', fig.height=6, fig.width=6}
+# Instalação condicional do pacote corrplot
+if(!require(corrplot)) install.packages("corrplot")
+library(corrplot)
+
+# Selecionar variáveis numéricas para correlação
+# Removemos linhas com dados faltantes para o cálculo
+df_cor <- df %>%
+  select(obts, pop_est, saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf) %>%
+  cor(use = "complete.obs")
+
+# Visualização da Matriz
+corrplot(df_cor, 
+         method = "color", 
+         type = "upper",        # Apenas a parte superior
+         order = "hclust",      # Agrupa variáveis similares
+         addCoef.col = "black", # Adiciona os coeficientes numéricos
+         tl.col = "black",      # Cor do texto dos rótulos
+         tl.srt = 45,           # Rotação dos rótulos
+         number.cex = 0.7,      # Tamanho dos números
+         diag = FALSE,          # Remove a diagonal principal (correlação 1)
+         title = "Matriz de Correlação", 
+         mar = c(0,0,1,0))
+
+```
+
+## Relação Individual: Preditores vs Taxa de Mortalidade
+
+Visualizamos como cada variável explicativa se relaciona com a **taxa de mortalidade** (por 100k habitantes). Utilizamos a taxa no eixo Y para remover o efeito de tamanho populacional e identificar o risco real. As linhas vermelhas (suavização LOESS) ajudam a identificar tendências não-lineares.
+
+```{r eda_preditores_all, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+# Criar dataframe auxiliar com taxa para plotagem
+df_plot <- df %>% 
+  mutate(taxa_100k = (obts / pop_est) * 100000) %>%
+  filter(pop_est > 0)
+
+# 1. Saneamento vs Taxa
+g1 <- ggplot(df_plot, aes(x = saneat, y = taxa_100k)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+  labs(x = "Saneamento (Domicílios)", y = "Taxa de Mortalidade") +
+  theme_light()
+
+# 2. PIB per Capita vs Taxa
+g2 <- ggplot(df_plot, aes(x = pib_pc, y = taxa_100k)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+  labs(x = "PIB per Capita", y = "Taxa de Mortalidade") +
+  theme_light()
+
+# 3. Proporção de Baixa Renda vs Taxa
+g3 <- ggplot(df_plot, aes(x = prop_bx_renda, y = taxa_100k)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+  labs(x = "Prop. Baixa Renda (%)", y = "Taxa de Mortalidade") +
+  theme_light()
+
+# 4. Renda Média Domiciliar vs Taxa
+g4 <- ggplot(df_plot, aes(x = renda_med_dom, y = taxa_100k)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+  labs(x = "Renda Média Domiciliar", y = "Taxa de Mortalidade") +
+  theme_light()
+
+# 5. Taxa de Analfabetismo vs Taxa
+g5 <- ggplot(df_plot, aes(x = tx_analf, y = taxa_100k)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+  labs(x = "Tx. Analfabetismo (%)", y = "Taxa de Mortalidade") +
+  theme_light()
+
+# Exibição conjunta
+grid.arrange(g1, g2, g3, g4, g5, ncol = 2, 
+             top = "Relação entre Preditores e Taxa de Mortalidade")
+
+```
+
