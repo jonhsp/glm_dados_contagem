@@ -31,9 +31,9 @@ A variável resposta é a contagem de pedestres traumatizados em um acidente de 
 A variável resposta será o número de óbitos (obt_ocor), modelado como contagem. A variável pop_est será utilizada como offset (log da população) para ajustar o modelo pela exposição.
 
 # Preparação dos Dados
-<br><br>
 
-## Leitura
+## Leitura e Tratamento
+
 ```{r setup, message=FALSE, warning=FALSE, include=FALSE}
 libs <- c("ggplot2",
           "dplyr",
@@ -47,7 +47,10 @@ libs <- c("ggplot2",
           "plotly",
           "rgl",
           "magick",
-          "viridis")
+          "viridis",
+          "pscl",
+          "corrplot",
+          "lmtest")
 
 for (lib in libs){
   
@@ -57,46 +60,43 @@ for (lib in libs){
 }
 
 ```
-
 ```{r leitura, message=FALSE, warning=FALSE}
+# URL dos dados (Apenas o link puro, sem colchetes ou parenteses extras)
 url <- "https://gist.githubusercontent.com/jonhsp/83dd3cee85f9db48af0652fe7cd7ec97/raw/e503d660eac30e8eeec6ff2e1e20a46189440dce/DadosParaPobreSemExcel%2520-%2520DadosParaPobreSemExcel.csv"
 
-df <- read_csv(url)
-
-```
-
-# Tratando a base 
-```{r}
-# Renomeando para nomes mais simples
-
-df <- df %>%
+df <- read_csv(url) %>%
+  # Renomear para garantir consistência
   rename(
-    municipio      = Municipio,
-    obts           = obts,
-    saneat         = Saneat,
-    pib_pc         = PibPerCapita,
-    prop_bx_renda  = PrpBxRnd,
-    renda_med_dom  = RndMdDom,
-    tx_analf       = TxAnalf,
-    pop_est        = PopEst
+    municipio = Municipio,
+    obts = obts,
+    saneat = Saneat,
+    pib_pc = PibPerCapita,
+    prop_bx_renda = PrpBxRnd,
+    renda_med_dom = RndMdDom,
+    tx_analf = TxAnalf,
+    pop_est = PopEst
   ) %>%
-# Garantindo tipo numérico nas variáveis quantitativas
-mutate(
-  across(
-    c(obts, saneat, pib_pc, prop_bx_renda,
-      renda_med_dom, tx_analf, pop_est),
-    ~ as.numeric(.x)
-  )
-) %>%
-# Removendo linhas com NA
-drop_na() %>%
-# Removendo municípios com população zero (evita log(0))
-  filter(pop_est > 0)
-summary(df)
+  # Tratamento de caracteres e conversão numérica
+  mutate(across(
+    c(saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf, pop_est),
+    ~ as.numeric(str_replace_all(as.character(.), ",", "."))
+  )) %>%
+  drop_na() %>%
+  filter(pop_est > 0) %>%
+  # --- ENGENHARIA DE VARIÁVEIS ---
+  # 1. Log da População (Offset obrigatório)
+  mutate(log_pop = log(pop_est)) %>%
+  # 2. Proporção de Saneamento (Para evitar colinearidade com a população absoluta)
+  mutate(prop_saneat = (saneat / pop_est) * 100) %>%
+  # 3. Taxa de Mortalidade (Apenas para visualização gráfica)
+  mutate(taxa_100k = (obts / pop_est) * 100000)
 
+glimpse(df)
 ```
+<br><br>
 
 # Análise Exploratória
+<br><br>
 
 ## Distribuição da Variável Resposta (Y)
 
@@ -124,85 +124,230 @@ p2 <- ggplot(df, aes(y = obts)) +
 
 grid.arrange(p1, p2, ncol = 2)
 ```
+<br><br>
 
 ## Correlação entre Variáveis (Multicolinearidade)
 
 Verificamos a estrutura de correlação entre todas as variáveis numéricas disponíveis. O objetivo é identificar redundâncias que possam causar instabilidade no modelo (Multicolinearidade).
 
 ```{r eda_correlacao, message=FALSE, warning=FALSE, fig.align='center', fig.height=6, fig.width=6}
-# Instalação condicional do pacote corrplot
-if(!require(corrplot)) install.packages("corrplot")
-library(corrplot)
-
 # Selecionar variáveis numéricas para correlação
-# Removemos linhas com dados faltantes para o cálculo
 df_cor <- df %>%
-  select(obts, pop_est, saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf) %>%
+  select(obts, pop_est, prop_saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf) %>%
   cor(use = "complete.obs")
 
-# Visualização da Matriz
+# Plotar Matriz
 corrplot(df_cor, 
-         method = "color", 
-         type = "upper",        # Apenas a parte superior
-         order = "hclust",      # Agrupa variáveis similares
-         addCoef.col = "black", # Adiciona os coeficientes numéricos
-         tl.col = "black",      # Cor do texto dos rótulos
-         tl.srt = 45,           # Rotação dos rótulos
-         number.cex = 0.7,      # Tamanho dos números
-         diag = FALSE,          # Remove a diagonal principal (correlação 1)
-         title = "Matriz de Correlação", 
-         mar = c(0,0,1,0))
+         method = "color", type = "upper", order = "hclust", 
+         addCoef.col = "black", tl.col = "black", tl.srt = 45, 
+         number.cex = 0.7, diag = FALSE, 
+         title = "Matriz de Correlação", mar = c(0,0,1,0))
 
 ```
+<br><br>
 
 ## Relação Individual: Preditores vs Taxa de Mortalidade
 
 Visualizamos como cada variável explicativa se relaciona com a **taxa de mortalidade** (por 100k habitantes). Utilizamos a taxa no eixo Y para remover o efeito de tamanho populacional e identificar o risco real. As linhas vermelhas (suavização LOESS) ajudam a identificar tendências não-lineares.
 
 ```{r eda_preditores_all, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
-# Criar dataframe auxiliar com taxa para plotagem
-df_plot <- df %>% 
-  mutate(taxa_100k = (obts / pop_est) * 100000) %>%
-  filter(pop_est > 0)
+# Função auxiliar para plotagem uniforme
+plot_dispersao <- function(var_x, label_x) {
+  ggplot(df, aes(x = {{var_x}}, y = taxa_100k)) +
+    geom_point(alpha = 0.4, color = "steelblue") +
+    geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
+    labs(x = label_x, y = "Taxa (/100k)") +
+    theme_light()
+}
 
-# 1. Saneamento vs Taxa
-g1 <- ggplot(df_plot, aes(x = saneat, y = taxa_100k)) +
-  geom_point(alpha = 0.4, color = "steelblue") +
-  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
-  labs(x = "Saneamento (Domicílios)", y = "Taxa de Mortalidade") +
-  theme_light()
-
-# 2. PIB per Capita vs Taxa
-g2 <- ggplot(df_plot, aes(x = pib_pc, y = taxa_100k)) +
-  geom_point(alpha = 0.4, color = "steelblue") +
-  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
-  labs(x = "PIB per Capita", y = "Taxa de Mortalidade") +
-  theme_light()
-
-# 3. Proporção de Baixa Renda vs Taxa
-g3 <- ggplot(df_plot, aes(x = prop_bx_renda, y = taxa_100k)) +
-  geom_point(alpha = 0.4, color = "steelblue") +
-  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
-  labs(x = "Prop. Baixa Renda (%)", y = "Taxa de Mortalidade") +
-  theme_light()
-
-# 4. Renda Média Domiciliar vs Taxa
-g4 <- ggplot(df_plot, aes(x = renda_med_dom, y = taxa_100k)) +
-  geom_point(alpha = 0.4, color = "steelblue") +
-  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
-  labs(x = "Renda Média Domiciliar", y = "Taxa de Mortalidade") +
-  theme_light()
-
-# 5. Taxa de Analfabetismo vs Taxa
-g5 <- ggplot(df_plot, aes(x = tx_analf, y = taxa_100k)) +
-  geom_point(alpha = 0.4, color = "steelblue") +
-  geom_smooth(method = "loess", color = "darkred", size = 0.8, se = FALSE) +
-  labs(x = "Tx. Analfabetismo (%)", y = "Taxa de Mortalidade") +
-  theme_light()
+# Gerar plots
+g1 <- plot_dispersao(prop_saneat, "Saneamento (%)")
+g2 <- plot_dispersao(pib_pc, "PIB per Capita")
+g3 <- plot_dispersao(prop_bx_renda, "Prop. Baixa Renda (%)")
+g4 <- plot_dispersao(renda_med_dom, "Renda Média Domiciliar")
+g5 <- plot_dispersao(tx_analf, "Tx. Analfabetismo (%)")
 
 # Exibição conjunta
 grid.arrange(g1, g2, g3, g4, g5, ncol = 2, 
              top = "Relação entre Preditores e Taxa de Mortalidade")
 
 ```
+<br><br>
+ 
+# Modelagem Estatística
+<br><br>
 
+## Definição do Modelo e o Uso de Taxas (Offset)
+
+A variável resposta deste estudo ($Y_i$) refere-se à contagem de óbitos por causas externas no $i$-ésimo município. Sendo uma variável discreta e não negativa, a modelagem via regressão linear (que assume normalidade e continuidade) seria inadequada.
+
+Utilizamos, portanto, a estrutura dos **Modelos Lineares Generalizados (GLM)** para dados de contagem.
+
+### O Desafio da População (Offset)
+Comparar diretamente o número absoluto de óbitos entre municípios seria enviesado, pois municípios mais populosos naturalmente apresentam mais ocorrências, mesmo que sejam mais seguros. O objetivo é modelar a **Taxa de Mortalidade** ($\mu_i / t_i$), onde $t_i$ é a população exposta ao risco.
+
+Matematicamente, utilizamos a função de ligação logarítmica. Partindo da modelagem da taxa:
+
+$$\ln \left( \frac{\mu_i}{t_i} \right) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki}$$
+
+Utilizando as propriedades do logaritmo, isolamos a média da contagem ($\mu_i$):
+
+$$\ln(\mu_i) - \ln(t_i) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki}$$
+
+$$\ln(\mu_i) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki} + \underbrace{1 \cdot \ln(t_i)}_{\text{Offset}}$$
+
+O termo $\ln(t_i)$ entra no modelo como um **Offset**: uma variável preditora cujo coeficiente é fixado em 1. Isso garante que o modelo ajuste a contagem esperada proporcionalmente ao tamanho da população, permitindo a interpretação dos coeficientes em termos de risco relativo.
+
+## 4.2 Modelo Base: Poisson e a Evidência de Sobredispersão
+
+O ponto de partida para dados de contagem é a distribuição de Poisson, que assume equidispersão: a variância dos dados deve ser igual à média ($Var(Y) = E(Y)$).
+
+Ajustamos abaixo o modelo saturado (com todas as variáveis disponíveis) para verificar essa suposição.
+
+```{r mod_poisson_base, message=FALSE, warning=FALSE}
+# Ajuste do Modelo de Poisson com todas as variáveis
+# Offset entra como argumento para fixar o coeficiente em 1
+modelo_poisson <- glm(obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom, 
+                      family = poisson(link = "log"), 
+                      offset = log_pop,
+                      data = df)
+
+# Cálculo da Razão de Dispersão (Deviance / Graus de Liberdade)
+disp_poisson <- sum(residuals(modelo_poisson, type = "pearson")^2) / df.residual(modelo_poisson)
+
+cat("--- Diagnóstico de Sobredispersão ---\n")
+cat("Residual Deviance: ", deviance(modelo_poisson), "\n")
+cat("Graus de Liberdade:", df.residual(modelo_poisson), "\n")
+cat("Razão de Dispersão:", round(disp_poisson, 2))
+
+```
+
+Diagnóstico: O modelo de Poisson apresentou uma Razão de Dispersão de r round(disp_poisson, 2), valor drasticamente superior ao esperado (que seria próximo de 1).
+
+Isso confirma a existência de sobredispersão severa. Na prática, isso significa que o modelo de Poisson subestima os erros-padrão, fazendo com que variáveis pareçam significativas quando não são. É necessário, portanto, adotar modelos que flexibilizem a variância, como a Binomial Negativa ou modelos de mistura.
+
+
+## 4.3 Tratamento da Variabilidade: Modelos de Mistura (Zero-Inflated)
+
+Dado a sobredispersão extrema e o excesso de zeros, a distribuição de Poisson padrão é insuficiente. Adotamos modelos de mistura que consideram dois processos geradores:
+1.  **Componente Zero (Logit):** Modela a probabilidade de um município ter "imunidade" ao risco (zero estrutural).
+2.  **Componente de Contagem:** Modela a frequência de óbitos nos municípios expostos.
+
+Ajustamos abaixo o modelo **ZIP** (Zero-Inflated Poisson) e o **ZINB** (Zero-Inflated Negative Binomial) para determinar se a inflação de zeros é suficiente para corrigir a dispersão ou se ainda é necessário um parâmetro de dispersão extra ($\theta$).
+
+```{r mod_zero_inflated, message=FALSE, warning=FALSE}
+# Definição da Fórmula Inicial (Saturada)
+# Lado Esquerdo: Contagem + Offset | Lado Direito: Zeros
+# Nota: Usamos a coluna 'log_pop' criada anteriormente
+f_zero <- obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom + offset(log_pop) | pib_pc + tx_analf + prop_bx_renda
+
+# Ajuste do Modelo ZIP (Poisson)
+modelo_zip <- zeroinfl(f_zero, data = df, dist = "poisson")
+
+# Ajuste do Modelo ZINB (Binomial Negativa)
+modelo_zinb <- zeroinfl(f_zero, data = df, dist = "negbin")
+
+# Comparação via AIC
+aic_comp <- data.frame(
+  Modelo = c("ZIP (Poisson)", "ZINB (Binomial Negativa)"),
+  AIC = c(AIC(modelo_zip), AIC(modelo_zinb)),
+  LogLik = c(logLik(modelo_zip), logLik(modelo_zinb))
+)
+
+knitr::kable(aic_comp, caption = "Comparação de Ajuste: ZIP vs ZINB")
+```
+Decisão pelo Modelo ZIP: Observa-se que o modelo ZIP apresentou o menor AIC (582.92) comparado ao ZINB (584.92). A diferença é de exatos 2.0, e o Log-Likelihood é idêntico para ambos (-282.46). Isso prova matematicamente que o parâmetro de dispersão extra ($\theta$) da Binomial Negativa não contribuiu para o ajuste. Portanto, o tratamento dos zeros via Poisson inflacionada foi suficiente para corrigir a sobredispersão inicial.
+
+
+## Seleção de Variáveis (Stepwise)
+
+Com o modelo ZIP definido como a melhor abordagem para tratar os zeros e a sobredispersão, aplicamos o algoritmo *stepwise* (baseado no critério AIC) para selecionar os preditores mais relevantes.
+
+O processo avalia a remoção de variáveis tanto do componente de **contagem** quanto do componente **zero**, buscando o modelo mais simples e explicativo.
+
+```{r selecao_stepwise, message=FALSE, warning=FALSE}
+# 1. Preparação para o Stepwise
+# Redefinimos a fórmula retirando o offset de dentro dela (passaremos como argumento)
+# para evitar erros técnicos na função step()
+f_selecao <- obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom | pib_pc + tx_analf + prop_bx_renda
+
+# 2. Ajuste do Modelo Base para Seleção
+# Nota: offset = log_pop é passado aqui fora
+modelo_zip_base <- zeroinfl(f_selecao,
+                            data = df,
+                            dist = "poisson",
+                            offset = log_pop)
+
+# 3. Execução da Seleção (Direction = Both)
+# trace = 1 exibe o processo de decisão (opcional, aqui usamos 0 para limpar o relatório)
+modelo_final <- step(modelo_zip_base, direction = "both", trace = 0)
+
+# 4. Resumo do Modelo Final
+cat ("---- Summary ----\n")
+summary(modelo_final)
+cat("\n---- Teste de Razão de Verossimilhança ----\n")
+lrtest(modelo_final, modelo_zip_base,modelo_poisson)
+cat("\n ---- AIC ----\n")
+AIC(modelo_final, modelo_zip_base,modelo_poisson)
+
+```
+
+# Interpretação dos Resultados e Equações do Modelo
+
+O modelo final selecionado (**ZIP - Zero-Inflated Poisson**) assume que os dados são gerados por uma mistura de dois processos estatísticos distintos:
+
+1.  **Processo de Contagem (Poisson):** Modela a intensidade da taxa de mortalidade para os municípios expostos ao risco.
+2.  **Processo de Zeros (Logit):** Modela a probabilidade $\pi$ de um município pertencer ao grupo de "zeros estruturais" (imunidade ou ausência sistemática de risco).
+
+## Especificação das Equações Estimadas
+
+Abaixo, apresentamos as equações com os coeficientes ($\beta$ e $\gamma$) estimados pelo modelo final.
+
+### 1. Equação de Contagem (Risco)
+Esta equação descreve o logaritmo do número esperado de óbitos ($\mu_i$), considerando o *offset* populacional:
+
+$$
+\begin{aligned}
+\ln(\mu_i) = & \ln(\text{Pop}_i) + (`r round(coef(modelo_final, "count")[1], 3)`) \\
+& + (`r round(coef(modelo_final, "count")["tx_analf"], 3)`) \cdot \text{Analfa}_i \\
+& + (`r round(coef(modelo_final, "count")["prop_saneat"], 3)`) \cdot \text{Saneamento}_i \\
+& + (`r round(coef(modelo_final, "count")["pib_pc"], 3)`) \cdot \text{PIB}_{pc,i}
+\end{aligned}
+$$
+
+### 2. Equação de Inflação de Zeros (Imunidade)
+Esta equação descreve o *log-odds* da probabilidade $\pi_i$ de o município ter zero óbitos estruturais:
+
+$$
+\begin{aligned}
+\ln \left( \frac{\pi_i}{1 - \pi_i} \right) = & (`r round(coef(modelo_final, "zero")[1], 3)`) \\
+& + (`r round(coef(modelo_final, "zero")["tx_analf"], 3)`) \cdot \text{Analfa}_i \\
+& + (`r round(coef(modelo_final, "zero")["pib_pc"], 3)`) \cdot \text{PIB}_{pc,i}
+\end{aligned}
+$$
+
+<small>*Nota: Coeficientes positivos na equação de zeros indicam maior chance de não ter óbitos (fator de proteção).*</small>
+
+---
+
+## Análise dos Efeitos (Razão de Taxas)
+
+Para interpretar a magnitude dos efeitos no componente de contagem, exponencializamos os coeficientes para obter a **Razão de Taxas** ($RR = e^\beta$).
+
+```{r interpretacao_rr, echo=FALSE}
+# Extração e cálculo do RR e IC para o modelo de contagem
+rr_count <- exp(cbind(RR = coef(modelo_final, model = "count"), confint(modelo_final, model = "count")))
+knitr::kable(rr_count, digits = 4, caption = "Componente de Contagem: Razão de Taxas (Rate Ratios)")
+```
+
+Interpretação Prática:
+
+1. Taxa de Analfabetismo ($RR \approx `r round(exp(coef(modelo_final, "count")["tx_analf"]), 3)`$):
+- É o principal fator de risco. Para cada ponto percentual adicional na taxa de analfabetismo, a taxa esperada de óbitos por causas externas aumenta em aproximadamente r (round(exp(coef(modelo_final, "count")["tx_analf"]), 3) - 1)*100%, mantendo as demais variáveis constantes.
+<br>
+2. Saneamento e PIB ($RR < 1$):
+- Ambas as variáveis apresentam $RR < 1$, indicando que atuam como fatores de proteção.
+<br>
+- O aumento na cobertura de saneamento e no PIB per capita está associado a uma redução estatisticamente significativa na mortalidade, sugerindo que o desenvolvimento infraestrutural e econômico mitiga a violência e acidentes letais.
+3. Componente de Zeros (Analfabetismo):
+- Na equação logística dos zeros, o coeficiente do analfabetismo é negativo ($\gamma \approx `r round(coef(modelo_final, "zero")["tx_analf"], 2)`$). Isso indica que quanto maior o analfabetismo, menor é a chance de o município ter zero óbitos (ou seja, municípios com pior educação quase nunca estão "imunes" à ocorrência de mortes violentas).
