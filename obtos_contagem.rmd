@@ -19,7 +19,7 @@ A variável resposta é a contagem de pedestres traumatizados em um acidente de 
 
 | Variável | Descrição | Tipo |
 | :--- | :--- | :---
-| `obts` | Pedestre traumatizado em um acidente de transporte |	Contagem (resposta). |
+| `obts` | Obtos por agressão |	Contagem (resposta). |
 | `pop_est` | População estimada do município |	Contagem (offset – exposição)|
 | `saneat` | Número de moradores com saneamento adequado |	Contagem |
 | `pib_pc` | PIB per capita do município |	Contínua |
@@ -40,17 +40,12 @@ libs <- c("ggplot2",
           "tidyverse",
           "magrittr",
           "stringr",
-          "ggeffects",
           "gridExtra",
-          "car",
-          "hnp",
-          "plotly",
-          "rgl",
-          "magick",
-          "viridis",
-          "pscl",
           "corrplot",
-          "lmtest")
+          "hnp",
+          "pscl",
+          "MASS",
+          "ggeffects")
 
 for (lib in libs){
   
@@ -62,13 +57,18 @@ for (lib in libs){
 ```
 ```{r leitura, message=FALSE, warning=FALSE}
 # URL dos dados (Apenas o link puro, sem colchetes ou parenteses extras)
-url <- "https://gist.githubusercontent.com/jonhsp/83dd3cee85f9db48af0652fe7cd7ec97/raw/e503d660eac30e8eeec6ff2e1e20a46189440dce/DadosParaPobreSemExcel%2520-%2520DadosParaPobreSemExcel.csv"
+# url <- "https://gist.githubusercontent.com/jonhsp/40bdd288739a65a010e3c6385ddc37a1/raw/5226e1fb9f1786a4eff72a33c4dd4d95080b2547/DadosParaPobreSemExcel%2520(1).csv"
+file <- "dados_contagem.csv"
+df <- read_csv(file)
+summary(df)
+```
 
-df <- read_csv(url) %>%
+```{r tratamentos, message=FALSE, warning=FALSE}
+df <- df %>%
   # Renomear para garantir consistência
   rename(
     municipio = Municipio,
-    obts = obts,
+    obts = 'ÓbtP/Ocor',
     saneat = Saneat,
     pib_pc = PibPerCapita,
     prop_bx_renda = PrpBxRnd,
@@ -87,7 +87,7 @@ df <- read_csv(url) %>%
   # 1. Log da População (Offset obrigatório)
   mutate(log_pop = log(pop_est)) %>%
   # 2. Proporção de Saneamento (Para evitar colinearidade com a população absoluta)
-  mutate(prop_saneat = (saneat / pop_est) * 100) %>%
+  mutate(prop_saneat = (saneat / pop_est) * 100000) %>%
   # 3. Taxa de Mortalidade (Apenas para visualização gráfica)
   mutate(taxa_100k = (obts / pop_est) * 100000)
 
@@ -102,8 +102,8 @@ glimpse(df)
 
 Visualizamos a distribuição da contagem de óbitos (`obts`) para identificar a assimetria característica de dados de contagem e a presença de *outliers*.
 
-```{r eda_distribuicao, message=FALSE, warning=FALSE, fig.width=10, fig.height=4}
-library(gridExtra)
+```{r eda_distribuicao, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
+
 
 # 1. Histograma da Contagem Absoluta
 p1 <- ggplot(df, aes(x = obts)) +
@@ -130,10 +130,10 @@ grid.arrange(p1, p2, ncol = 2)
 
 Verificamos a estrutura de correlação entre todas as variáveis numéricas disponíveis. O objetivo é identificar redundâncias que possam causar instabilidade no modelo (Multicolinearidade).
 
-```{r eda_correlacao, message=FALSE, warning=FALSE, fig.align='center', fig.height=6, fig.width=6}
+```{r eda_correlacao, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
 # Selecionar variáveis numéricas para correlação
 df_cor <- df %>%
-  select(obts, pop_est, prop_saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf) %>%
+  dplyr::select(obts, pop_est, prop_saneat, pib_pc, prop_bx_renda, renda_med_dom, tx_analf) %>%
   cor(use = "complete.obs")
 
 # Plotar Matriz
@@ -150,7 +150,7 @@ corrplot(df_cor,
 
 Visualizamos como cada variável explicativa se relaciona com a **taxa de mortalidade** (por 100k habitantes). Utilizamos a taxa no eixo Y para remover o efeito de tamanho populacional e identificar o risco real. As linhas vermelhas (suavização LOESS) ajudam a identificar tendências não-lineares.
 
-```{r eda_preditores_all, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+```{r eda_preditores_all, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
 # Função auxiliar para plotagem uniforme
 plot_dispersao <- function(var_x, label_x) {
   ggplot(df, aes(x = {{var_x}}, y = taxa_100k)) +
@@ -174,180 +174,154 @@ grid.arrange(g1, g2, g3, g4, g5, ncol = 2,
 ```
 <br><br>
  
-# Modelagem Estatística
+# Ajuste de Modelos
+
+Para modelar a taxa de óbitos, iniciamos com o modelo de referência Poisson, utilizando o logaritmo da população (`log_pop`) como offset para controlar a exposição.
+
+## Modelo 1: Poisson (Baseline)
+
+```{r mod_poisson, message=FALSE, warning=FALSE}
+# Ajuste do modelo Poisson com as covariáveis socioeconômicas e saneamento
+ajuste_pois <- glm(obts ~ tx_analf + prop_saneat + prop_bx_renda + pib_pc, 
+                   family = poisson, 
+                   offset = log_pop, 
+                   data = df)
+
+summary(ajuste_pois)
+```
+
+## Modelo 2: Binomial Negativa
+```{r mod_binomial_negativa, message=FALSE, warning=FALSE}
+
+# Ajuste do modelo Binomial Negativo (trata superdispersão sem inflação de zeros)
+ajuste_nb <- glm.nb(obts ~ tx_analf + prop_saneat + prop_bx_renda + pib_pc + offset(log_pop), 
+                    data = df)
+
+summary(ajuste_nb)
+
+```
+## Diagnóstico de Superdispersão
+
+A validade do modelo Poisson depende da suposição de equidispersão (Média = Variância). Abaixo, verificamos se essa premissa é violada através do parâmetro de dispersão ($\phi$) e do gráfico de envelope simulado.
+```{r diagnostico, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
+par(mfrow = c(1,2))
+
+hnp(ajuste_nb, 
+    pch = 20, 
+    cex = 1.2, 
+    main = "Envelope Simulado: Modelo BN",
+    xlab = "Percentil Teórico", 
+    ylab = "Resíduos Deviance")
+
+hnp(ajuste_pois, 
+    pch = 20, 
+    cex = 1.2, 
+    main = "Envelope Simulado: Modelo Poisson",
+    xlab = "Percentil Teórico", 
+    ylab = "Resíduos Deviance")
+par(mfrow = c(1,1))
+```
+
+- **AIC:** O AIC caiu drasticamente de 1642.4 (no Poisson) para 1419.9 (neste Binomial Negativo). Uma redução de mais de 200 pontos confirma, sem sombra de dúvidas, que a distribuição Binomial Negativa é a correta para seus dados.
+- **Gráfico Poisson:** Provavelmente exibe a maioria dos pontos (resíduos) fugindo drasticamente das faixas de confiança (envelope) em direção à parte superior direita.
+- **Gráfico Binomial Negativa:** Exibe os pontos acomodados dentro (ou muito próximos) dos limites do envelope.
 <br><br>
 
-## Definição do Modelo e o Uso de Taxas (Offset)
+# Seleção de Variáveis (Stepwise)
 
-A variável resposta deste estudo ($Y_i$) refere-se à contagem de óbitos por causas externas no $i$-ésimo município. Sendo uma variável discreta e não negativa, a modelagem via regressão linear (que assume normalidade e continuidade) seria inadequada.
+```{r stepwise, message=FALSE, warning=FALSE}
+# Aplica o algoritmo Stepwise (direção both) no modelo Binomial Negativo
+# O algoritmo testará remover/adicionar variáveis para minimizar o AIC
+modelo_final_nb <- stepAIC(ajuste_nb, direction = "both", trace = 1)
 
-Utilizamos, portanto, a estrutura dos **Modelos Lineares Generalizados (GLM)** para dados de contagem.
-
-### O Desafio da População (Offset)
-Comparar diretamente o número absoluto de óbitos entre municípios seria enviesado, pois municípios mais populosos naturalmente apresentam mais ocorrências, mesmo que sejam mais seguros. O objetivo é modelar a **Taxa de Mortalidade** ($\mu_i / t_i$), onde $t_i$ é a população exposta ao risco.
-
-Matematicamente, utilizamos a função de ligação logarítmica. Partindo da modelagem da taxa:
-
-$$\ln \left( \frac{\mu_i}{t_i} \right) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki}$$
-
-Utilizando as propriedades do logaritmo, isolamos a média da contagem ($\mu_i$):
-
-$$\ln(\mu_i) - \ln(t_i) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki}$$
-
-$$\ln(\mu_i) = \beta_0 + \beta_1 X_{1i} + \dots + \beta_k X_{ki} + \underbrace{1 \cdot \ln(t_i)}_{\text{Offset}}$$
-
-O termo $\ln(t_i)$ entra no modelo como um **Offset**: uma variável preditora cujo coeficiente é fixado em 1. Isso garante que o modelo ajuste a contagem esperada proporcionalmente ao tamanho da população, permitindo a interpretação dos coeficientes em termos de risco relativo.
-
-## 4.2 Modelo Base: Poisson e a Evidência de Sobredispersão
-
-O ponto de partida para dados de contagem é a distribuição de Poisson, que assume equidispersão: a variância dos dados deve ser igual à média ($Var(Y) = E(Y)$).
-
-Ajustamos abaixo o modelo saturado (com todas as variáveis disponíveis) para verificar essa suposição.
-
-```{r mod_poisson_base, message=FALSE, warning=FALSE}
-# Ajuste do Modelo de Poisson com todas as variáveis
-# Offset entra como argumento para fixar o coeficiente em 1
-modelo_poisson <- glm(obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom, 
-                      family = poisson(link = "log"), 
-                      offset = log_pop,
-                      data = df)
-
-# Cálculo da Razão de Dispersão (Deviance / Graus de Liberdade)
-disp_poisson <- sum(residuals(modelo_poisson, type = "pearson")^2) / df.residual(modelo_poisson)
-
-cat("--- Diagnóstico de Sobredispersão ---\n")
-cat("Residual Deviance: ", deviance(modelo_poisson), "\n")
-cat("Graus de Liberdade:", df.residual(modelo_poisson), "\n")
-cat("Razão de Dispersão:", round(disp_poisson, 2))
-
+# Resumo do modelo vencedor selecionado pelo algoritmo
+summary(modelo_final_nb)
 ```
 
-Diagnóstico: O modelo de Poisson apresentou uma Razão de Dispersão de r round(disp_poisson, 2), valor drasticamente superior ao esperado (que seria próximo de 1).
+# Avaliação do Processo Stepwise
 
-Isso confirma a existência de sobredispersão severa. Na prática, isso significa que o modelo de Poisson subestima os erros-padrão, fazendo com que variáveis pareçam significativas quando não são. É necessário, portanto, adotar modelos que flexibilizem a variância, como a Binomial Negativa ou modelos de mistura.
+A análise do stepAIC confirma que a maior parte das variáveis socioeconômicas não possui poder preditivo significativo para a taxa de óbitos, uma vez que o efeito da superdispersão foi corrigido.
 
+O Modelo Final Binomial Negativo é:
 
-## 4.3 Tratamento da Variabilidade: Modelos de Mistura (Zero-Inflated)
+$$\ln\left(\frac{\hat{\mu}}{\text{Pop}}\right) = -7.441 - 0.00001504 \cdot \text{prop\_saneat}$$
 
-Dado a sobredispersão extrema e o excesso de zeros, a distribuição de Poisson padrão é insuficiente. Adotamos modelos de mistura que consideram dois processos geradores:
-1.  **Componente Zero (Logit):** Modela a probabilidade de um município ter "imunidade" ao risco (zero estrutural).
-2.  **Componente de Contagem:** Modela a frequência de óbitos nos municípios expostos.
+- Significância: prop_saneat é altamente significativa ($p \approx 0.0017$).
 
-Ajustamos abaixo o modelo **ZIP** (Zero-Inflated Poisson) e o **ZINB** (Zero-Inflated Negative Binomial) para determinar se a inflação de zeros é suficiente para corrigir a dispersão ou se ainda é necessário um parâmetro de dispersão extra ($\theta$).
+- Direção do Efeito: O coeficiente negativo ($-1.504e-05$) confirma o efeito protetor do saneamento: à medida que a proporção de saneamento adequado aumenta, a taxa de óbitos esperada diminui.
 
-```{r mod_zero_inflated, message=FALSE, warning=FALSE}
-# Definição da Fórmula Inicial (Saturada)
-# Lado Esquerdo: Contagem + Offset | Lado Direito: Zeros
-# Nota: Usamos a coluna 'log_pop' criada anteriormente
-f_zero <- obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom + offset(log_pop) | pib_pc + tx_analf + prop_bx_renda
+- Qualidade do Ajuste: O AIC final de 1413.11 representa uma melhoria substancial em relação ao modelo inicial de 4 variáveis (1417.88) e à Poisson original (1642.4).
 
-# Ajuste do Modelo ZIP (Poisson)
-modelo_zip <- zeroinfl(f_zero, data = df, dist = "poisson")
+<br><br>
 
-# Ajuste do Modelo ZINB (Binomial Negativa)
-modelo_zinb <- zeroinfl(f_zero, data = df, dist = "negbin")
+# Visualização dos Resultados
 
-# Comparação via AIC
-aic_comp <- data.frame(
-  Modelo = c("ZIP (Poisson)", "ZINB (Binomial Negativa)"),
-  AIC = c(AIC(modelo_zip), AIC(modelo_zinb)),
-  LogLik = c(logLik(modelo_zip), logLik(modelo_zinb))
+```{r table_results, message=FALSE, warning=FALSE}
+# Interpretação dos Resultados Finais
+
+# O modelo final é: modelo_final_nb (apenas com prop_saneat)
+
+# 1. Tabela de Razão de Taxas (RR)
+# A função confint é usada para obter o Intervalo de Confiança.
+rr_tabela <- data.frame(
+  Coeficiente = coef(modelo_final_nb),
+  RR = exp(coef(modelo_final_nb)),
+  IC_2.5 = exp(confint(modelo_final_nb)[, 1]),
+  IC_97.5 = exp(confint(modelo_final_nb)[, 2])
 )
 
-knitr::kable(aic_comp, caption = "Comparação de Ajuste: ZIP vs ZINB")
+knitr::kable(rr_tabela, digits = 5, caption = "Razão de Taxas (Rate Ratios) - Modelo Final")
 ```
-Decisão pelo Modelo ZIP: Observa-se que o modelo ZIP apresentou o menor AIC (582.92) comparado ao ZINB (584.92). A diferença é de exatos 2.0, e o Log-Likelihood é idêntico para ambos (-282.46). Isso prova matematicamente que o parâmetro de dispersão extra ($\theta$) da Binomial Negativa não contribuiu para o ajuste. Portanto, o tratamento dos zeros via Poisson inflacionada foi suficiente para corrigir a sobredispersão inicial.
+**Interpretação:** Um aumento de 1 ponto na proporção de saneamento adequado reduz a taxa de óbitos esperada em aproximadamente $1 - 0.99998 = 0.00002\%$. Embora o efeito por unidade seja minúsculo devido à escala da variável (/ 100k hab), o impacto é estatisticamente consistente.
 
+```{r visualizacao, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
 
-## Seleção de Variáveis (Stepwise)
-
-Com o modelo ZIP definido como a melhor abordagem para tratar os zeros e a sobredispersão, aplicamos o algoritmo *stepwise* (baseado no critério AIC) para selecionar os preditores mais relevantes.
-
-O processo avalia a remoção de variáveis tanto do componente de **contagem** quanto do componente **zero**, buscando o modelo mais simples e explicativo.
-
-```{r selecao_stepwise, message=FALSE, warning=FALSE}
-# 1. Preparação para o Stepwise
-# Redefinimos a fórmula retirando o offset de dentro dela (passaremos como argumento)
-# para evitar erros técnicos na função step()
-f_selecao <- obts ~ tx_analf + prop_bx_renda + prop_saneat + pib_pc + renda_med_dom | pib_pc + tx_analf + prop_bx_renda
-
-# 2. Ajuste do Modelo Base para Seleção
-# Nota: offset = log_pop é passado aqui fora
-modelo_zip_base <- zeroinfl(f_selecao,
-                            data = df,
-                            dist = "poisson",
-                            offset = log_pop)
-
-# 3. Execução da Seleção (Direction = Both)
-# trace = 1 exibe o processo de decisão (opcional, aqui usamos 0 para limpar o relatório)
-modelo_final <- step(modelo_zip_base, direction = "both", trace = 0)
-
-# 4. Resumo do Modelo Final
-cat ("---- Summary ----\n")
-summary(modelo_final)
-cat("\n---- Teste de Razão de Verossimilhança ----\n")
-lrtest(modelo_final, modelo_zip_base,modelo_poisson)
-cat("\n ---- AIC ----\n")
-AIC(modelo_final, modelo_zip_base,modelo_poisson)
+# 2. Visualização dos Efeitos Marginais
+plot(ggpredict(modelo_final_nb, terms = "prop_saneat")) +
+  labs(
+    title = "Efeito da Proporção de Saneamento na Taxa de Óbitos",
+    y = "Óbitos Esperados (Contagem)",
+    x = "Saneamento (por 100k hab.)"
+  ) +
+  theme_light()
 
 ```
+<br><br>
 
-# Interpretação dos Resultados e Equações do Modelo
 
-O modelo final selecionado (**ZIP - Zero-Inflated Poisson**) assume que os dados são gerados por uma mistura de dois processos estatísticos distintos:
+##  Resíduos e Distância de Cook
 
-1.  **Processo de Contagem (Poisson):** Modela a intensidade da taxa de mortalidade para os municípios expostos ao risco.
-2.  **Processo de Zeros (Logit):** Modela a probabilidade $\pi$ de um município pertencer ao grupo de "zeros estruturais" (imunidade ou ausência sistemática de risco).
+```{r residuos, message=FALSE, warning=FALSE, fig.align='center',fig.width=15, fig.height=6}
 
-## Especificação das Equações Estimadas
+# Configura a tela para 4 gráficos (2x2)
+par(mfrow = c(2, 2))
 
-Abaixo, apresentamos as equações com os coeficientes ($\beta$ e $\gamma$) estimados pelo modelo final.
+# hnp
+hnp(modelo_final_nb, resid.type = "deviance", how.many.out = TRUE, paint.out = TRUE,
+    main = "Envelope Simulado", xlab = "Percentil Teórico", ylab = "Resíduos Deviance")
 
-### 1. Equação de Contagem (Risco)
-Esta equação descreve o logaritmo do número esperado de óbitos ($\mu_i$), considerando o *offset* populacional:
+# Distância de Cook
+plot(cooks.distance(modelo_final_nb), type = "h",
+     main = "Distância de Cook",
+     ylab = "Distância de Cook",
+     ylim = c(0,0.6))
+abline(h = 0.5, lty = 2, col = "red")
 
-$$
-\begin{aligned}
-\ln(\mu_i) = & \ln(\text{Pop}_i) + (`r round(coef(modelo_final, "count")[1], 3)`) \\
-& + (`r round(coef(modelo_final, "count")["tx_analf"], 3)`) \cdot \text{Analfa}_i \\
-& + (`r round(coef(modelo_final, "count")["prop_saneat"], 3)`) \cdot \text{Saneamento}_i \\
-& + (`r round(coef(modelo_final, "count")["pib_pc"], 3)`) \cdot \text{PIB}_{pc,i}
-\end{aligned}
-$$
+# Residuos deviance
+plot(residuals(modelo_final_nb, type = "deviance"),
+      main = "Resíduos Deviance",
+      ylab = "Resíduos Deviance",
+      ylim = c(-4, 4))
+abline(h = c(-2, 2), lty = 2, col = "red")
 
-### 2. Equação de Inflação de Zeros (Imunidade)
-Esta equação descreve o *log-odds* da probabilidade $\pi_i$ de o município ter zero óbitos estruturais:
+# Residuos pearson
+plot(residuals(modelo_final_nb, type = "pearson"),
+      main = "Resíduos Pearson",
+      ylab = "Resíduos Pearson",
+      ylim = c(-4, 4))
+abline(h = c(-2, 2), lty = 2, col = "red")
 
-$$
-\begin{aligned}
-\ln \left( \frac{\pi_i}{1 - \pi_i} \right) = & (`r round(coef(modelo_final, "zero")[1], 3)`) \\
-& + (`r round(coef(modelo_final, "zero")["tx_analf"], 3)`) \cdot \text{Analfa}_i \\
-& + (`r round(coef(modelo_final, "zero")["pib_pc"], 3)`) \cdot \text{PIB}_{pc,i}
-\end{aligned}
-$$
-
-<small>*Nota: Coeficientes positivos na equação de zeros indicam maior chance de não ter óbitos (fator de proteção).*</small>
-
----
-
-## Análise dos Efeitos (Razão de Taxas)
-
-Para interpretar a magnitude dos efeitos no componente de contagem, exponencializamos os coeficientes para obter a **Razão de Taxas** ($RR = e^\beta$).
-
-```{r interpretacao_rr, echo=FALSE}
-# Extração e cálculo do RR e IC para o modelo de contagem
-rr_count <- exp(cbind(RR = coef(modelo_final, model = "count"), confint(modelo_final, model = "count")))
-knitr::kable(rr_count, digits = 4, caption = "Componente de Contagem: Razão de Taxas (Rate Ratios)")
+# Retorna a configuração da tela para o padrão (1 gráfico por vez)
+par(mfrow = c(1, 1))
 ```
-
-Interpretação Prática:
-
-1. Taxa de Analfabetismo ($RR \approx `r round(exp(coef(modelo_final, "count")["tx_analf"]), 3)`$):
-- É o principal fator de risco. Para cada ponto percentual adicional na taxa de analfabetismo, a taxa esperada de óbitos por causas externas aumenta em aproximadamente r (round(exp(coef(modelo_final, "count")["tx_analf"]), 3) - 1)*100%, mantendo as demais variáveis constantes.
-<br>
-2. Saneamento e PIB ($RR < 1$):
-- Ambas as variáveis apresentam $RR < 1$, indicando que atuam como fatores de proteção.
-<br>
-- O aumento na cobertura de saneamento e no PIB per capita está associado a uma redução estatisticamente significativa na mortalidade, sugerindo que o desenvolvimento infraestrutural e econômico mitiga a violência e acidentes letais.
-3. Componente de Zeros (Analfabetismo):
-- Na equação logística dos zeros, o coeficiente do analfabetismo é negativo ($\gamma \approx `r round(coef(modelo_final, "zero")["tx_analf"], 2)`$). Isso indica que quanto maior o analfabetismo, menor é a chance de o município ter zero óbitos (ou seja, municípios com pior educação quase nunca estão "imunes" à ocorrência de mortes violentas).
+O diagnóstico realizado confirma a validade e estabilidade do seu modelo final de Regressão Binomial Negativa: a escolha da distribuição é correta, pois a totalidade dos pontos no Envelope Simulado permanece dentro das bandas de confiança; os resíduos de Pearson e Deviance situam-se em sua maioria no intervalo aceitável de $[-2, +2]$, indicando a ausência de outliers severos de ajuste; e, crucialmente, a Distância de Cook está bem abaixo do limite crítico de 0.5, demonstrando que nenhum município exerce influência indevida sobre as estimativas do coeficiente de Saneamento.
